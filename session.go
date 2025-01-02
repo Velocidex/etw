@@ -1,5 +1,5 @@
-//go:build windows
-// +build windows
+//go:build windows && cgo
+// +build windows,cgo
 
 // Package etw allows you to receive Event Tracing for Windows (ETW) events.
 //
