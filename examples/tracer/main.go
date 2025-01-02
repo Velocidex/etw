@@ -4,141 +4,201 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"sync"
+	"regexp"
+	"strings"
+	"sync/atomic"
 	"time"
 
-	"golang.org/x/sys/windows"
+	_ "net/http/pprof"
 
 	"github.com/Velocidex/etw"
+	"golang.org/x/sys/windows"
 )
 
+var (
+	optSilent  = flag.Bool("silent", false, "Stop sending logs to stderr")
+	optSession = flag.String("session", "etw-test", "Session Name")
+	optTimeout = flag.Int("timeout", 5, "Capture only for this timeout")
+	optID      = flag.Int("id", -1, "Capture only specified ID")
+	optEvents  = flag.String("events", "registry,process", "Any of these separated by ,: registry,process,image_load,network,driver,file")
+	optStacks  = flag.String("stack", "", "To enable stack traces for these event types: Any of these separated by ,: registry,process,image_load,network,driver,file")
+	optProfile = flag.Int("profile", 0, "Enable profile server on this port")
+
+	optKernelEventTypeFilter = flag.String("kernel_event_type_filter", ".", "Filter event types")
+)
+
+var count uint64
+
 func main() {
-	var (
-		optSilent = flag.Bool("silent", false, "Stop sending logs to stderr")
-		optHeader = flag.Bool("header", false, "Show event header in output")
-		optBulk   = flag.Bool("bulk", false, "Use bulk mode")
-		optID     = flag.Int("id", -1, "Capture only specified ID")
-	)
 	flag.Parse()
 
-	if flag.NArg() != 1 && !*optBulk {
-		log.Fatalf("Usage: %s [opts] <providerGUID>", filepath.Base(os.Args[0]))
-	}
 	if *optSilent {
 		log.SetOutput(ioutil.Discard)
 	}
 
-	session, err := etw.NewSession("etw-test-" + randomName())
+	if *optProfile > 0 {
+		go func() {
+			log.Println(http.ListenAndServe(
+				fmt.Sprintf("localhost:%v", *optProfile), nil))
+		}()
+	}
+
+	event_type_filter, err := regexp.Compile(*optKernelEventTypeFilter)
 	if err != nil {
-		log.Fatalf("Failed to create etw session; %s", err)
+		log.Fatalf("kernel_event_type_filter regex invalid: %v\n", *optKernelEventTypeFilter)
 	}
-
-	if *optBulk {
-		smbServer, _ := windows.GUIDFromString("{D48CE617-33A2-4BC3-A5C7-11AA4F29619E}")
-		smbClient, _ := windows.GUIDFromString("{988C59C5-0A1C-45B6-A555-0C62276E327E}")
-		kProcess, _ := windows.GUIDFromString("{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}")
-		kIO, _ := windows.GUIDFromString("{ABF1F586-2E50-4BA8-928D-49044E6F0DB7}")
-
-		providers := []etw.SessionOptions{
-			{
-				Guid: smbServer,
-			},
-			{
-				Guid: smbClient,
-			},
-			{
-				Guid: kProcess,
-			},
-			{
-				Guid: kIO,
-			},
-		}
-
-		for _, provider := range providers {
-			session.UpdateOptions(provider.Guid)
-		}
-	} else {
-		guid, err := windows.GUIDFromString(flag.Arg(0))
-		if err != nil {
-			log.Fatalf("Incorrect GUID given; %s", err)
-		}
-		session.UpdateOptions(guid)
-	}
-
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	cb := func(e *etw.Event) {
-		log.Printf("[DBG] Event %d from %s\n", e.Header.ID, e.Header.TimeStamp)
-		if *optID > 0 && *optID != int(e.Header.ID) {
-			return
-		}
-
-		event := make(map[string]interface{})
-		if *optHeader {
-			event["Header"] = e.Header
-		}
-		if data, err := e.EventProperties(); err == nil {
-			event["EventProperties"] = data
-		} else {
-			log.Printf("[ERR] Failed to enumerate event properties: %s", err)
-		}
-		_ = enc.Encode(event)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		log.Printf("[DBG] Starting to listen ETW events")
-
-		// Block until .Close().
-		if err := session.Process(cb); err != nil {
-			log.Printf("[ERR] Got error processing events: %s", err)
-		} else {
-			log.Printf("[DBG] Successfully shut down")
-		}
-
-		wg.Done()
-	}()
 
 	// Trap cancellation (the only signal values guaranteed to be present in
 	// the os package on all systems are os.Interrupt and os.Kill).
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 
-	// Wait for stop and shutdown gracefully.
-	for range sigCh {
-		log.Printf("[DBG] Shutting the session down")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-		err = session.Close()
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	cb := func(e *etw.Event) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if *optID > 0 && *optID != int(e.Header.ID) {
+			return
+		}
+
+		out := e.Parsed()
+
+		if event_type_filter.MatchString(e.Header.KernelLoggerType.String()) {
+			etw.GetLazyProperty(e, "Backtrace")
+			_ = enc.Encode(out)
+			atomic.AddUint64(&count, 1)
+		}
+	}
+	session, err := NewSession(flag.Arg(0), *optSession, cb)
+	if err != nil {
+		log.Fatalf("Failed to create etw session; %s", err)
+		return
+	}
+	defer session.Close()
+
+	for _, arg := range flag.Args() {
+		guid, err := windows.GUIDFromString(arg)
 		if err != nil {
-			log.Printf("[ERR] (!!!) Failed to stop session: %s\n", err)
+			log.Fatalf("Incorrect GUID given; %s", err)
+		}
+
+		opts := etw.SessionOptions{
+			Guid:          guid,
+			Level:         etw.TraceLevel(255),
+			CaptureState:  true,
+			EnableMapInfo: false,
+		}
+		err = session.SubscribeToProvider(opts)
+		log.Printf("[DBG] SubscribeToProvider %v\n", err)
+
+		defer session.UnsubscribeFromProvider(guid)
+	}
+
+	go func() {
+		defer cancel()
+
+		log.Printf("[DBG] Starting to listen to ETW events")
+
+		// Block until .Close().
+		if err := session.Process(); err != nil {
+			log.Printf("[ERR] Got error processing events: %s", err)
 		} else {
-			break
+			log.Printf("[DBG] Successfully shut down")
+		}
+	}()
+
+	go func() {
+		time.Sleep(time.Second * time.Duration(*optTimeout))
+		log.Printf("[DBG] Closing session %v due to timeout with %v events received",
+			*optSession, atomic.LoadUint64(&count))
+
+		cancel()
+	}()
+
+	// Wait for stop and shutdown gracefully.
+	<-ctx.Done()
+
+	log.Printf("[DBG] Shutting the session down")
+}
+
+func NewSession(guid, name string, cb func(e *etw.Event)) (*etw.Session, error) {
+	if strings.EqualFold(guid, etw.KernelTraceControlGUIDString) {
+		opts, err := parseOpts(*optEvents)
+		if err != nil {
+			return nil, err
+		}
+
+		if *optStacks != "" {
+			stack_opts, err := parseOpts(*optStacks)
+			if err != nil {
+				return nil, err
+			}
+			opts.StackTracing = stack_opts
+		}
+
+		session, err := etw.NewKernelTraceSession(*opts, cb)
+		if err != nil {
+			err = etw.KillSession(etw.KernelTraceSessionName)
+			if err != nil {
+				return nil, err
+			}
+
+			session, err = etw.NewKernelTraceSession(*opts, cb)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return session, nil
+	}
+
+	session, err := etw.NewSession(name, cb)
+	if err != nil {
+		err = etw.KillSession(name)
+		if err != nil {
+			return nil, err
+		}
+
+		session, err = etw.NewSession(name, cb)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	wg.Wait()
+	return session, nil
 }
 
-func randomName() string {
-	if g, err := windows.GenerateGUID(); err == nil {
-		return g.String()
+func parseOpts(in string) (*etw.RundownOptions, error) {
+	opts := &etw.RundownOptions{}
+
+	for _, item := range strings.Split(in, ",") {
+		err := opts.Set(item)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// should be almost impossible, right?
-	rand.Seed(time.Now().UnixNano())
-	const alph = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, 32)
-	for i := range b {
-		b[i] = alph[rand.Intn(len(alph))]
-	}
-	return string(b)
+	return opts, nil
 }

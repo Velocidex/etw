@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <evntcons.h>
 #include <tdh.h>
+#include <winternl.h>
 
 // OpenTraceHelper helps to access EVENT_TRACE_LOGFILEW union fields and pass
 // pointer to C not warning CGO checker.
@@ -46,3 +47,41 @@ ULONGLONG GetDataPtr(PEVENT_HEADER_EXTENDED_DATA_ITEM extData, int idx);
 USHORT GetDataSize(PEVENT_HEADER_EXTENDED_DATA_ITEM extData, int idx);
 ULONG GetAddress32(PEVENT_EXTENDED_ITEM_STACK_TRACE32 trace32, int idx);
 ULONGLONG GetAddress64(PEVENT_EXTENDED_ITEM_STACK_TRACE64 trace64, int idx);
+
+
+
+NTSYSCALLAPI NTSTATUS NtQueryObject(
+  HANDLE                   Handle,
+  OBJECT_INFORMATION_CLASS ObjectInformationClass,
+  PVOID                    ObjectInformation,
+  ULONG                    ObjectInformationLength,
+  PULONG                   ReturnLength
+);
+
+// This struct definition seems wrong in winternl.h
+// https://doxygen.reactos.org/d7/d19/struct____OBJECT__TYPE__INFORMATION.html
+typedef struct _MyOBJECT_TYPE_INFORMATION {
+    UNICODE_STRING TypeName;
+    ULONG TotalNumberOfObjects;
+    ULONG TotalNumberOfHandles;
+    ULONG TotalPagedPoolUsage;
+    ULONG TotalNonPagedPoolUsage;
+    ULONG TotalNamePoolUsage;
+    ULONG TotalHandleTableUsage;
+    ULONG HighWaterNumberOfObjects;
+    ULONG HighWaterNumberOfHandles;
+    ULONG HighWaterPagedPoolUsage;
+    ULONG HighWaterNonPagedPoolUsage;
+    ULONG HighWaterNamePoolUsage;
+    ULONG HighWaterHandleTableUsage;
+    ULONG InvalidAttributes;
+    GENERIC_MAPPING GenericMapping;
+    ULONG ValidAccessMask;
+    BOOLEAN SecurityRequired;
+    BOOLEAN MaintainHandleCount;
+    UCHAR TypeIndex;
+    CHAR Reserved;
+    ULONG PoolType;
+    ULONG DefaultPagedPoolCharge;
+    ULONG DefaultNonPagedPoolCharge;
+} MyOBJECT_TYPE_INFORMATION, *PMyOBJECT_TYPE_INFORMATION;

@@ -9,10 +9,11 @@ package etw
 import "C"
 import (
 	"fmt"
-	"math"
+	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/Velocidex/ordereddict"
 	"golang.org/x/sys/windows"
 )
 
@@ -23,8 +24,41 @@ import (
 // Events will be passed to the user EventCallback. It's invalid to use Event
 // methods outside of an EventCallback.
 type Event struct {
-	Header      EventHeader
+	mu sync.Mutex
+
+	Header EventHeader
+
+	// Cached parsed fields. It is possible for an event callback to
+	// mutate these fields to add/replace any field. This allows a
+	// callback to enrich or correct any of the raw data parsed from
+	// the ETW system.
+	parsed      *ordereddict.Dict
+	event_props *ordereddict.Dict
+	header      *ordereddict.Dict
+
+	// A Lazy function to resolve the backtrace if available.
+	backtrace func() interface{}
+
 	eventRecord C.PEVENT_RECORD
+}
+
+func (self *Event) Backtrace() interface{} {
+	if self.backtrace != nil {
+		return self.backtrace()
+	}
+	return []string{}
+}
+
+func (self *Event) MarshalJSON() ([]byte, error) {
+	tmp := ordereddict.NewDict().
+		Set("System", self.HeaderProps()).
+		Set("EventData", self.Props())
+
+	if self.backtrace != nil {
+		tmp.Set("Backtrace", self.Backtrace())
+	}
+
+	return tmp.MarshalJSON()
 }
 
 // EventHeader contains an information that is common for every ETW event
@@ -47,6 +81,11 @@ type EventHeader struct {
 	KernelTime    uint32
 	UserTime      uint32
 	ProcessorTime uint64
+
+	// For the kernel logger the actual event ID is encoded in the
+	// OpCode and the provider GUID. We parse these to generate a
+	// KernelLoggerType so we can act on it more efficiently.
+	KernelLoggerType KernelLoggerType
 }
 
 // HasCPUTime returns true if the event has separate UserTime and KernelTime
@@ -94,37 +133,76 @@ type EventDescriptor struct {
 //   - `string` for any other values.
 //
 // Take a look at `TestParsing` for possible EventProperties values.
-func (e *Event) EventProperties(resolveMapInfo bool) (map[string]interface{}, error) {
+func (e *Event) EventProperties(resolveMapInfo bool) (*ordereddict.Dict, error) {
 	if e.eventRecord == nil {
 		return nil, fmt.Errorf("usage of Event is invalid outside of EventCallback")
 	}
 
 	if e.eventRecord.EventHeader.Flags == C.EVENT_HEADER_FLAG_STRING_ONLY {
-		return map[string]interface{}{
-			"_": C.GoString((*C.char)(e.eventRecord.UserData)),
-		}, nil
+		return ordereddict.NewDict().Set(
+			"_", C.GoString((*C.char)(e.eventRecord.UserData))), nil
 	}
 
-	p, err := newPropertyParser(e.eventRecord)
+	p, err := newPropertyParser(e.eventRecord, resolveMapInfo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse event properties; %w", err)
+		// Cant parse the properties, just forward an empty set.
+		return ordereddict.NewDict(), nil
 	}
 	defer p.free()
 
-	p.resolveMapInfo = resolveMapInfo
+	return p.EventProperties()
+}
 
-	properties := make(map[string]interface{}, int(p.info.TopLevelPropertyCount))
-	for i := 0; i < int(p.info.TopLevelPropertyCount); i++ {
-		name := p.getPropertyName(i)
-		value, err := p.getPropertyValue(i)
-		if err != nil {
-			// Parsing values we consume given event data buffer with var length chunks.
-			// If we skip any -- we'll lost offset, so fail early.
-			return nil, fmt.Errorf("failed to parse %q value; %w", name, err)
-		}
-		properties[name] = value
+func (self *Event) Parsed() *ordereddict.Dict {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.parsed != nil {
+		return self.parsed
 	}
-	return properties, nil
+
+	event := ordereddict.NewDict()
+	self.header = ordereddict.NewDict().
+		Set("ID", self.Header.ID).
+		Set("ProcessID", self.Header.ProcessID).
+		Set("TimeStamp", self.Header.TimeStamp).
+		Set("Provider", self.Header.ProviderID.String()).
+		Set("OpCode", self.Header.OpCode)
+	event.Set("Header", self.header)
+
+	if self.Header.KernelLoggerType != UnknownLoggerType {
+		self.header.Set(
+			"KernelEventType", self.Header.KernelLoggerType.String())
+	}
+
+	data, err := self.EventProperties(false)
+	if err == nil {
+		event.Set("EventProperties", data)
+		self.event_props = data
+	} else {
+		self.event_props = ordereddict.NewDict()
+	}
+
+	self.parsed = event
+	return event
+}
+
+func (self *Event) Props() *ordereddict.Dict {
+	self.Parsed()
+
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.event_props
+}
+
+func (self *Event) HeaderProps() *ordereddict.Dict {
+	self.Parsed()
+
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.header
 }
 
 // ExtendedEventInfo contains additional information about received event. All
@@ -247,298 +325,4 @@ func (e *Event) parseExtendedInfo() ExtendedEventInfo {
 		}
 	}
 	return extendedData
-}
-
-// propertyParser is used for parsing properties from raw EVENT_RECORD structure.
-type propertyParser struct {
-	record  C.PEVENT_RECORD
-	info    C.PTRACE_EVENT_INFO
-	data    uintptr
-	endData uintptr
-	ptrSize uintptr
-
-	// Resolving MapInfo is very expensive and it is not needed much
-	// of the time. Provide this to optionally skip this step.
-	resolveMapInfo bool
-}
-
-func newPropertyParser(r C.PEVENT_RECORD) (*propertyParser, error) {
-	info, err := getEventInformation(r)
-	if err != nil {
-		if info != nil {
-			C.free(unsafe.Pointer(info))
-		}
-		return nil, fmt.Errorf("failed to get event information; %w", err)
-	}
-	ptrSize := unsafe.Sizeof(uint64(0))
-	if r.EventHeader.Flags&C.EVENT_HEADER_FLAG_32_BIT_HEADER == C.EVENT_HEADER_FLAG_32_BIT_HEADER {
-		ptrSize = unsafe.Sizeof(uint32(0))
-	}
-	return &propertyParser{
-		record:  r,
-		info:    info,
-		ptrSize: ptrSize,
-		data:    uintptr(r.UserData),
-		endData: uintptr(r.UserData) + uintptr(r.UserDataLength),
-	}, nil
-}
-
-// getEventInformation wraps TdhGetEventInformation. It extracts some kind of
-// simplified event information used by Tdh* family of function.
-//
-// Returned info MUST be freed after use.
-func getEventInformation(pEvent C.PEVENT_RECORD) (C.PTRACE_EVENT_INFO, error) {
-	var (
-		pInfo      C.PTRACE_EVENT_INFO
-		bufferSize C.ulong
-	)
-
-	// Retrieve a buffer size.
-	ret := C.TdhGetEventInformation(pEvent, 0, nil, pInfo, &bufferSize)
-	if windows.Errno(ret) == windows.ERROR_INSUFFICIENT_BUFFER {
-		pInfo = C.PTRACE_EVENT_INFO(C.malloc(C.size_t(bufferSize)))
-		if pInfo == nil {
-			return nil, fmt.Errorf("malloc(%v) failed", bufferSize)
-		}
-
-		// Fetch the buffer itself.
-		ret = C.TdhGetEventInformation(pEvent, 0, nil, pInfo, &bufferSize)
-	}
-
-	if status := windows.Errno(ret); status != windows.ERROR_SUCCESS {
-		return pInfo, fmt.Errorf("TdhGetEventInformation failed; %w", status)
-	}
-
-	return pInfo, nil
-}
-
-// free frees associated PTRACE_EVENT_INFO if any assigned.
-func (p *propertyParser) free() {
-	if p.info != nil {
-		C.free(unsafe.Pointer(p.info))
-	}
-}
-
-// getPropertyName returns a name of the @i-th event property.
-func (p *propertyParser) getPropertyName(i int) string {
-	propertyName := uintptr(C.GetPropertyName(p.info, C.int(i)))
-	length := C.wcslen((C.PWCHAR)(unsafe.Pointer(propertyName)))
-	return createUTF16String(propertyName, int(length))
-}
-
-// getPropertyValue retrieves a value of @i-th property.
-//
-// N.B. getPropertyValue HIGHLY depends not only on @i but also on memory
-// offsets, so check twice calling with non-sequential indexes.
-func (p *propertyParser) getPropertyValue(i int) (interface{}, error) {
-	var arraySizeC C.uint
-	ret := C.GetArraySize(p.record, p.info, C.int(i), &arraySizeC)
-	if status := windows.Errno(ret); status != windows.ERROR_SUCCESS {
-		return nil, fmt.Errorf("failed to get array size; %w", status)
-	}
-
-	arraySize := int(arraySizeC)
-	result := make([]interface{}, arraySize)
-	for j := 0; j < arraySize; j++ {
-		var (
-			value interface{}
-			err   error
-		)
-		// Note that we pass same idx to parse function. Actual returned values are controlled
-		// by data pointers offsets.
-		if int(C.PropertyIsStruct(p.info, C.int(i))) == 1 {
-			value, err = p.parseStruct(i)
-		} else {
-			value, err = p.parseSimpleType(i)
-		}
-
-		if err == nil {
-			result[j] = value
-		}
-	}
-
-	if int(C.PropertyIsArray(p.info, C.int(i))) == 1 {
-		return result, nil
-	}
-	return result[0], nil
-}
-
-// parseStruct tries to extract fields of embedded structure at property @i.
-func (p *propertyParser) parseStruct(i int) (map[string]interface{}, error) {
-	startIndex := int(C.GetStructStartIndex(p.info, C.int(i)))
-	lastIndex := int(C.GetStructLastIndex(p.info, C.int(i)))
-
-	structure := make(map[string]interface{}, lastIndex-startIndex)
-	for j := startIndex; j < lastIndex; j++ {
-		name := p.getPropertyName(j)
-		value, err := p.getPropertyValue(j)
-		if err != nil {
-			return nil, fmt.Errorf("failed parse field %q of complex property type; %w", name, err)
-		}
-		structure[name] = value
-	}
-	return structure, nil
-}
-
-// For some weird reasons non of mingw versions has TdhFormatProperty defined
-// so the only possible way is to use a DLL here.
-//
-//nolint:gochecknoglobals
-var (
-	tdh               = windows.NewLazySystemDLL("Tdh.dll")
-	tdhFormatProperty = tdh.NewProc("TdhFormatProperty")
-)
-
-// parseSimpleType wraps TdhFormatProperty to get rendered to string value of
-// @i-th event property.
-func (p *propertyParser) parseSimpleType(i int) (string, error) {
-	var mapInfo unsafe.Pointer
-	var err error
-
-	// This function call is very expensive and can hold up the
-	// processing loop causing many events to be dropped. We
-	// optionally can disable looking up the map info completely. This
-	// seems to work well for most providers.
-	if p.resolveMapInfo {
-		mapInfo, err = getMapInfo(p.record, p.info, i)
-		if err != nil {
-			return "", fmt.Errorf("failed to get map info; %w", err)
-		}
-	}
-
-	var propertyLength C.uint
-	ret := C.GetPropertyLength(p.record, p.info, C.int(i), &propertyLength)
-	if status := windows.Errno(ret); status != windows.ERROR_SUCCESS {
-		return "", fmt.Errorf("failed to get property length; %w", status)
-	}
-
-	inType := uintptr(C.GetInType(p.info, C.int(i)))
-	outType := uintptr(C.GetOutType(p.info, C.int(i)))
-
-	// We are going to guess a value size to save a DLL call, so preallocate.
-	var (
-		userDataConsumed  C.int
-		formattedDataSize C.int = 50
-	)
-	formattedData := make([]byte, int(formattedDataSize))
-
-retryLoop:
-	for {
-		r0, _, _ := tdhFormatProperty.Call(
-			uintptr(unsafe.Pointer(p.record)),
-			uintptr(mapInfo),
-			p.ptrSize,
-			inType,
-			outType,
-			uintptr(propertyLength),
-			p.endData-p.data,
-			p.data,
-			uintptr(unsafe.Pointer(&formattedDataSize)),
-			uintptr(unsafe.Pointer(&formattedData[0])),
-			uintptr(unsafe.Pointer(&userDataConsumed)),
-		)
-
-		switch status := windows.Errno(r0); status {
-		case windows.ERROR_SUCCESS:
-			break retryLoop
-
-		case windows.ERROR_INSUFFICIENT_BUFFER:
-			formattedData = make([]byte, int(formattedDataSize))
-			continue
-
-		case windows.ERROR_EVT_INVALID_EVENT_DATA:
-			// Can happen if the MapInfo doesn't match the actual data, e.g pure ETW provider
-			// works with the outdated WEL manifest. Discarding MapInfo allows us to access
-			// at least the non-interpreted data.
-			if mapInfo != nil {
-				mapInfo = nil
-				continue
-			}
-			fallthrough // Can't fix. Error.
-
-		default:
-			return "", fmt.Errorf("TdhFormatProperty failed; %w", status)
-		}
-	}
-	p.data += uintptr(userDataConsumed)
-
-	return createUTF16String(uintptr(unsafe.Pointer(&formattedData[0])), int(formattedDataSize)), nil
-}
-
-// getMapInfo retrieve the mapping between the @i-th field and the structure it represents.
-// If that mapping exists, function extracts it and returns a pointer to the buffer with
-// extracted info. If no mapping defined, function can legitimately return `nil, nil`.
-func getMapInfo(event C.PEVENT_RECORD, info C.PTRACE_EVENT_INFO, i int) (unsafe.Pointer, error) {
-	mapName := C.GetMapName(info, C.int(i))
-
-	// Query map info if any exists.
-	var mapSize C.ulong
-	ret := C.TdhGetEventMapInformation(event, mapName, nil, &mapSize)
-	switch status := windows.Errno(ret); status {
-	case windows.ERROR_NOT_FOUND:
-		return nil, nil // Pretty ok, just no map info
-	case windows.ERROR_INSUFFICIENT_BUFFER:
-		// Info exists -- need a buffer.
-	default:
-		return nil, fmt.Errorf("TdhGetEventMapInformation failed to get size; %w", status)
-	}
-
-	// Get the info itself.
-	mapInfo := make([]byte, int(mapSize))
-	ret = C.TdhGetEventMapInformation(
-		event,
-		mapName,
-		(C.PEVENT_MAP_INFO)(unsafe.Pointer(&mapInfo[0])),
-		&mapSize)
-	if status := windows.Errno(ret); status != windows.ERROR_SUCCESS {
-		return nil, fmt.Errorf("TdhGetEventMapInformation failed; %w", status)
-	}
-
-	if len(mapInfo) == 0 {
-		return nil, nil
-	}
-	return unsafe.Pointer(&mapInfo[0]), nil
-}
-
-func windowsGUIDToGo(guid C.GUID) windows.GUID {
-	var data4 [8]byte
-	for i := range data4 {
-		data4[i] = byte(guid.Data4[i])
-	}
-	return windows.GUID{
-		Data1: uint32(guid.Data1),
-		Data2: uint16(guid.Data2),
-		Data3: uint16(guid.Data3),
-		Data4: data4,
-	}
-}
-
-// stampToTime translates FileTime to a golang time. Same as in standard packages.
-func stampToTime(quadPart C.LONGLONG) time.Time {
-	ft := windows.Filetime{
-		HighDateTime: uint32(quadPart >> 32),
-		LowDateTime:  uint32(quadPart & math.MaxUint32),
-	}
-	return time.Unix(0, ft.Nanoseconds())
-}
-
-// Creates UTF16 string from raw parts.
-//
-// Actually in go we have no way to make a slice from raw parts, ref:
-// - https://github.com/golang/go/issues/13656
-// - https://github.com/golang/go/issues/19367
-// So the recommended way is "a fake cast" to the array with maximal len
-// with a following slicing.
-// Ref: https://github.com/golang/go/wiki/cgo#turning-c-arrays-into-go-slices
-func createUTF16String(ptr uintptr, len int) string {
-	// Race detector doesn't like this cast, but it's safe.
-	// ptr is represented as a kernel address > 0xC0'0000'0000
-	if !AllowKernelAccess && !inKernelSpace(ptr) {
-		return ""
-	}
-	if len == 0 {
-		return ""
-	}
-	bytes := (*[1 << 29]uint16)(unsafe.Pointer(ptr))[:len:len]
-	return windows.UTF16ToString(bytes)
 }

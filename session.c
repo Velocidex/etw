@@ -172,3 +172,7 @@ ULONG GetAddress32(PEVENT_EXTENDED_ITEM_STACK_TRACE32 trace32, int j) {
 ULONGLONG GetAddress64(PEVENT_EXTENDED_ITEM_STACK_TRACE64 trace64, int j) {
    return trace64->Address[j];
 }
+
+ULONG SetTraceSystemFlags(TRACEHANDLE handle, UINT32 *flags, int size) {
+    return TraceSetInformation(handle, TraceSystemTraceEnableFlagsInfo, flags, size);
+}

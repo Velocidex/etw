@@ -7,7 +7,11 @@ package etw
 	#include "windows.h"
 */
 import "C"
-import "golang.org/x/sys/windows"
+import (
+	"fmt"
+
+	"golang.org/x/sys/windows"
+)
 
 // SessionOptions describes Session subscription options.
 //
@@ -103,7 +107,8 @@ func WithLevel(lvl TraceLevel) Option {
 //
 // For more info take a look a SessionOptions docs. To query keywords defined
 // by specific provider identified by <GUID> try:
-//     logman query providers <GUID>
+//
+//	logman query providers <GUID>
 func WithMatchKeywords(anyKeyword, allKeyword uint64) Option {
 	return func(cfg *SessionOptions) {
 		cfg.MatchAnyKeyword = anyKeyword
@@ -166,3 +171,47 @@ const (
 	// InPrivate for this to work.
 	EVENT_ENABLE_PROPERTY_EXCLUDE_INPRIVATE = EnableProperty(0x200)
 )
+
+// These options apply to the KernelTracer
+type RundownOptions struct {
+	Registry, Process, ImageLoad,
+	Network, Driver, File, Thread, Handles bool
+
+	// If set we install stack tracing for those events
+	StackTracing *RundownOptions
+}
+
+// A convenience function to create a RundownOptions object from a
+// list of the
+func (self *RundownOptions) Set(trace_type string) error {
+	switch trace_type {
+	case "registry":
+		self.Registry = true
+
+	case "process":
+		self.Process = true
+
+	case "image_load":
+		self.ImageLoad = true
+
+	case "network":
+		self.Network = true
+
+	case "driver":
+		self.Driver = true
+
+	case "file":
+		self.File = true
+
+	case "thread":
+		self.Thread = true
+
+	case "handle":
+		self.Handles = true
+
+	default:
+		return fmt.Errorf("Invalid event type %v", trace_type)
+	}
+
+	return nil
+}
