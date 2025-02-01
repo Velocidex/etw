@@ -220,12 +220,12 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 
 		proc.(*Process).AddMapping(mapping)
 
-	case ReadFile, WriteFile, ReleaseFile:
+	case ReadFile, WriteFile, ReleaseFile, CloseFile:
 		event_props := e.Props()
-		FileObject, _ := event_props.GetString("FileObject")
+		FileObject, _ := event_props.GetString("FileKey")
 
 		filename, err := self.fileCache.Get(FileObject)
-		if err != nil {
+		if err == nil {
 			event_props.Set("FileName", filename)
 		}
 
@@ -250,6 +250,17 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 			FileName = self.normalizeFilename(FileName)
 			self.fileCache.Set(FileObject, FileName)
 			event_props.Update("FileName", FileName)
+		}
+
+	case SendTCPv4, RecvTCPv4, SendUDPv4, RecvUDPv4,
+		SendTCPv6, RecvTCPv6, SendUDPv6, RecvUDPv6,
+		DisconnectTCPv4, ReconnectTCPv4,
+		DisconnectTCPv6, ReconnectTCPv6:
+		event_props := e.Props()
+		PID, _ := event_props.GetString("PID")
+		if PID != "" {
+			header := e.HeaderProps()
+			header.Update("ProcessID", PID)
 		}
 
 	case StackWalk:
@@ -344,11 +355,11 @@ func NewKernelInfoManager() *KernelInfoManager {
 		fileCache:    ttlcache.NewCache(),
 	}
 
-	res.keysCache.SetCacheSizeLimit(10000)
-	res.processInfos.SetCacheSizeLimit(1000)
+	res.keysCache.SetCacheSizeLimit(100000)
+	res.processInfos.SetCacheSizeLimit(10000)
 	res.peCache.SetCacheSizeLimit(1000)
 	res.peCache.SetTTL(time.Minute * 10)
-	res.fileCache.SetCacheSizeLimit(10000)
+	res.fileCache.SetCacheSizeLimit(100000)
 
 	return res
 }

@@ -1,6 +1,13 @@
 //go:build windows
 // +build windows
 
+/*
+Listen to kernel events
+
+tracer.exe -stack file -events file -timeout 30 {9E814AAD-3204-11D2-9A82-006008A86939}
+
+*/
+
 package main
 
 import (
