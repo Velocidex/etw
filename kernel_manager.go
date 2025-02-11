@@ -309,7 +309,7 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 		}
 
 		// Unfortunately there are many cases where the key handle is
-		// not know.
+		// not known.
 		return e
 
 	case CreateHandle:
