@@ -85,9 +85,6 @@ func newPropertyParser(r C.PEVENT_RECORD,
 
 	info, err := getEventInformation(r)
 	if err != nil {
-		if info != nil {
-			C.free(unsafe.Pointer(info))
-		}
 		return nil, fmt.Errorf("failed to get event information; %w", err)
 	}
 	ptrSize := unsafe.Sizeof(uint64(0))
@@ -111,13 +108,17 @@ func newPropertyParser(r C.PEVENT_RECORD,
 func getEventInformation(pEvent C.PEVENT_RECORD) (C.PTRACE_EVENT_INFO, error) {
 	var (
 		// Start off with a reasonable buffer size
-		bufferSize C.ulong             = 1024
+		bufferSize C.ulong             = 1024 * 2
 		pInfo      C.PTRACE_EVENT_INFO = C.PTRACE_EVENT_INFO(C.malloc(C.size_t(bufferSize)))
 	)
 
 	// Retrieve a buffer size if it is not enough.
 	ret := C.TdhGetEventInformation(pEvent, 0, nil, pInfo, &bufferSize)
 	if windows.Errno(ret) == windows.ERROR_INSUFFICIENT_BUFFER {
+
+		// Resize the buffer for the requires size.
+		C.free(unsafe.Pointer(pInfo))
+
 		pInfo = C.PTRACE_EVENT_INFO(C.malloc(C.size_t(bufferSize)))
 		if pInfo == nil {
 			return nil, fmt.Errorf("malloc(%v) failed", bufferSize)
@@ -128,7 +129,8 @@ func getEventInformation(pEvent C.PEVENT_RECORD) (C.PTRACE_EVENT_INFO, error) {
 	}
 
 	if status := windows.Errno(ret); status != windows.ERROR_SUCCESS {
-		return pInfo, fmt.Errorf("TdhGetEventInformation failed; %w", status)
+		C.free(unsafe.Pointer(pInfo))
+		return nil, fmt.Errorf("TdhGetEventInformation failed; %w", status)
 	}
 
 	return pInfo, nil
@@ -139,6 +141,7 @@ func (p *propertyParser) free() {
 	if p.info != nil {
 		C.free(unsafe.Pointer(p.info))
 	}
+	p.info = nil
 }
 
 // getPropertyName returns a name of the @i-th event property.
