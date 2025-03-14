@@ -23,7 +23,7 @@ type PESymbols struct {
 	exports []PEExport
 }
 
-func (self *PESymbols) getFuncName(rva int64) string {
+func (self *PESymbols) GetFuncName(rva int64) string {
 	i := sort.Search(len(self.exports), func(i int) bool {
 		return self.exports[i].rva > rva
 	}) - 1
@@ -71,7 +71,7 @@ func (self *KernelInfoManager) NewMapping(event *ordereddict.Dict) (res *Mapping
 	return res, nil
 }
 
-func (self *KernelInfoManager) openPE(filename string) (*PESymbols, error) {
+func (self *KernelInfoManager) OpenPE(filename string) (*PESymbols, error) {
 	res := &PESymbols{}
 
 	fd, err := os.Open(filename)
