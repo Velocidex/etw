@@ -108,42 +108,11 @@ func NewKernelTraceSession(opts RundownOptions, cb EventCallback) (*Session, err
 	switch err := windows.Errno(ret); err {
 	case windows.ERROR_ALREADY_EXISTS:
 		return nil, ExistsError{SessionName: self.name}
+
 	case windows.ERROR_SUCCESS:
 		self.propertiesBuf = propertiesBuf
 
-		flags := make([]uint32, 8)
-
-		// To trigger rundown we need to first call
-		// TraceSetInformation with no flags and then again with the
-		// correct flags.
-		ret := C.TraceSetInformation(self.hSession, C.TraceSystemTraceEnableFlagsInfo,
-			C.PVOID(unsafe.Pointer(&flags[0])), C.ULONG(4*len(flags)))
-		err = windows.Errno(ret)
-		if err != windows.ERROR_SUCCESS {
-			return nil, err
-		}
-
-		flags[0] = getTraceFlags(opts)
-
-		if opts.Handles {
-			flags[4] = uint32(EVENT_TRACE_FLAG_HANDLE)
-		}
-
-		ret = C.TraceSetInformation(self.hSession, C.TraceSystemTraceEnableFlagsInfo,
-			C.PVOID(unsafe.Pointer(&flags[0])), C.ULONG(4*len(flags)))
-		err := windows.Errno(ret)
-		if err != windows.ERROR_SUCCESS {
-			return nil, err
-		}
-
-		if opts.StackTracing != nil {
-			err := installStackTraces(self, opts.StackTracing)
-			if err != windows.ERROR_SUCCESS {
-				return nil, err
-			}
-		}
-
-		return self, nil
+		return self, UpdateKernelTraceOptions(self, opts)
 	default:
 		return nil, fmt.Errorf("StartTraceW failed; %w", err)
 	}
@@ -237,4 +206,39 @@ func getTraceFlags(opts RundownOptions) uint32 {
 	}
 
 	return res
+}
+
+func UpdateKernelTraceOptions(self *Session, opts RundownOptions) error {
+	flags := make([]uint32, 8)
+
+	// To trigger rundown we need to first call TraceSetInformation
+	// with no flags and then again with the correct flags.
+	ret := C.TraceSetInformation(self.hSession, C.TraceSystemTraceEnableFlagsInfo,
+		C.PVOID(unsafe.Pointer(&flags[0])), C.ULONG(4*len(flags)))
+	err := windows.Errno(ret)
+	if err != windows.ERROR_SUCCESS {
+		return err
+	}
+
+	flags[0] = getTraceFlags(opts)
+
+	if opts.Handles {
+		flags[4] = uint32(EVENT_TRACE_FLAG_HANDLE)
+	}
+
+	ret = C.TraceSetInformation(self.hSession, C.TraceSystemTraceEnableFlagsInfo,
+		C.PVOID(unsafe.Pointer(&flags[0])), C.ULONG(4*len(flags)))
+	err = windows.Errno(ret)
+	if err != windows.ERROR_SUCCESS {
+		return err
+	}
+
+	if opts.StackTracing != nil {
+		err := installStackTraces(self, opts.StackTracing)
+		if err != windows.ERROR_SUCCESS {
+			return err
+		}
+	}
+
+	return nil
 }
