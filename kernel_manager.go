@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -52,6 +53,8 @@ type Handle struct {
 // A global manager that maintains information about the kernel. Can
 // be queried by other ETW processors.
 type KernelInfoManager struct {
+	mu sync.Mutex
+
 	// Does not change for the life of the program.
 	typeNames map[string]string
 
@@ -78,13 +81,20 @@ func (self *KernelInfoManager) Close() {
 	self.fileCache.Close()
 }
 
-func (self *KernelInfoManager) getType(typeId string) string {
+func (self *KernelInfoManager) GetType(typeId string) string {
 	name, ok := self.typeNames[typeId]
 	if ok {
 		return name
 	}
 
 	return ""
+}
+
+func (self *KernelInfoManager) NormalizeFilename(filename string) string {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.normalizeFilename(filename)
 }
 
 func (self *KernelInfoManager) normalizeFilename(filename string) string {
@@ -96,7 +106,38 @@ func (self *KernelInfoManager) normalizeFilename(filename string) string {
 	return filename
 }
 
-func (self *KernelInfoManager) decorateStackTraces(e *Event) func() interface{} {
+func (self *KernelInfoManager) GetFileCache(file_object string) (string, bool) {
+	res, err := self.fileCache.Get(file_object)
+	if err != nil {
+		return "", false
+	}
+
+	return res.(string), true
+}
+
+func (self *KernelInfoManager) SetFileCache(file_object string, filename string) {
+	self.fileCache.Set(file_object, filename)
+}
+
+func (self *KernelInfoManager) GetPEInfo(name string) (*PESymbols, bool) {
+	res, err := self.peCache.Get(name)
+	if err != nil {
+		return nil, false
+	}
+
+	return res.(*PESymbols), true
+}
+
+func (self *KernelInfoManager) GetProcessInfo(pid string) (*Process, bool) {
+	res, err := self.processInfos.Get(pid)
+	if err != nil || res == nil {
+		return nil, false
+	}
+
+	return res.(*Process), true
+}
+
+func (self *KernelInfoManager) DecorateStackTraces(e *Event) func() interface{} {
 	event_props := e.Props()
 	StackProcess, _ := event_props.GetString("StackProcess")
 	pid, err := strconv.ParseUint(StackProcess, 0, 64)
@@ -104,14 +145,14 @@ func (self *KernelInfoManager) decorateStackTraces(e *Event) func() interface{} 
 		return nil
 	}
 
-	kernel_process, err := self.processInfos.Get("0")
-	if err != nil {
+	kernel_process, pres := self.GetProcessInfo("0")
+	if !pres {
 		return nil
 	}
 
 	PidStr := strconv.FormatUint(pid, 10)
-	process, err := self.processInfos.Get(PidStr)
-	if err != nil {
+	process, pres := self.GetProcessInfo(PidStr)
+	if !pres {
 		return nil
 	}
 
@@ -143,11 +184,11 @@ func (self *KernelInfoManager) decorateStackTraces(e *Event) func() interface{} 
 					continue
 				}
 
-				mapping, pres = kernel_process.(*Process).GetMapping(addr)
+				mapping, pres = kernel_process.GetMapping(addr)
 			} else {
 
 				// Userspace
-				mapping, pres = process.(*Process).GetMapping(addr)
+				mapping, pres = process.GetMapping(addr)
 			}
 
 			if !pres {
@@ -156,7 +197,7 @@ func (self *KernelInfoManager) decorateStackTraces(e *Event) func() interface{} 
 
 			// Try to find the function name closest to the address
 			rva := int64(addr - mapping.BaseAddr)
-			func_name := self.guessFunctionName(mapping.Filename, rva)
+			func_name := self.GuessFunctionName(mapping.Filename, rva)
 
 			if func_name != "" {
 				tb = append(tb, fmt.Sprintf("%v!%v", mapping.dll, func_name))
@@ -170,7 +211,7 @@ func (self *KernelInfoManager) decorateStackTraces(e *Event) func() interface{} 
 	}
 }
 
-func (self *KernelInfoManager) guessFunctionName(
+func (self *KernelInfoManager) GuessFunctionName(
 	pe_path string, rva int64) string {
 
 	symbols, err := self.peCache.Get(pe_path)
@@ -235,7 +276,7 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 		FileObject, _ := event_props.GetString("FileObject")
 
 		if FileObject != "" && OpenPath != "" {
-			OpenPath = self.normalizeFilename(OpenPath)
+			OpenPath = self.NormalizeFilename(OpenPath)
 			event_props.Update("OpenPath", OpenPath)
 
 			self.fileCache.Set(FileObject, OpenPath)
@@ -247,7 +288,7 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 		FileName, _ := event_props.GetString("FileName")
 
 		if FileObject != "" && FileName != "" {
-			FileName = self.normalizeFilename(FileName)
+			FileName = self.NormalizeFilename(FileName)
 			self.fileCache.Set(FileObject, FileName)
 			event_props.Update("FileName", FileName)
 		}
@@ -264,7 +305,7 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 		}
 
 	case StackWalk:
-		tb := self.decorateStackTraces(e)
+		tb := self.DecorateStackTraces(e)
 		if tb == nil {
 			return nil
 		}
@@ -331,7 +372,7 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 		Type, _ := event_props.GetString("ObjectType")
 		ObjectName, _ := event_props.GetString("ObjectName")
 
-		ObjectName = self.normalizeFilename(ObjectName)
+		ObjectName = self.NormalizeFilename(ObjectName)
 		if ObjectName != "" {
 			event_props.Update("ObjectName", ObjectName)
 		}
