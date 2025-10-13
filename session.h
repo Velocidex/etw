@@ -50,7 +50,7 @@ ULONGLONG GetAddress64(PEVENT_EXTENDED_ITEM_STACK_TRACE64 trace64, int idx);
 
 
 
-NTSYSCALLAPI NTSTATUS NtQueryObject(
+NTAPI NTSTATUS NtQueryObject(
   HANDLE                   Handle,
   OBJECT_INFORMATION_CLASS ObjectInformationClass,
   PVOID                    ObjectInformation,
