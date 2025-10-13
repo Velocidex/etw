@@ -27,6 +27,8 @@ var (
 type Process struct {
 	PID int
 
+	Metadata *ordereddict.Dict
+
 	Mappings []*Mapping
 }
 
@@ -254,7 +256,6 @@ func (self *KernelInfoManager) GuessFunctionName(
 
 		self.SetPEInfo(pe_path, symbols)
 	}
-
 	return symbols.GetFuncName(rva)
 }
 
@@ -280,7 +281,10 @@ func (self *KernelInfoManager) processEvent(e *Event) (ret *Event) {
 
 		proc, pres := self.GetProcessInfo(PidStr)
 		if !pres {
-			proc = &Process{PID: int(mapping.Pid)}
+			proc = &Process{
+				PID:      int(mapping.Pid),
+				Metadata: ordereddict.NewDict(),
+			}
 			self.SetProcessInfo(PidStr, proc)
 		}
 

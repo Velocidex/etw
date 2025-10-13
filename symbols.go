@@ -4,6 +4,7 @@
 package etw
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,7 +30,11 @@ func (self *PESymbols) GetFuncName(rva int64) string {
 	}) - 1
 
 	if i >= 0 && i < len(self.exports) {
-		return self.exports[i].name
+		diff := rva - self.exports[i].rva
+		if diff == 0 {
+			return self.exports[i].name
+		}
+		return fmt.Sprintf("%s+%#x", self.exports[i].name, diff)
 	}
 	return ""
 }
