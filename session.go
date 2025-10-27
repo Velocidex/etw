@@ -27,6 +27,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+var (
+	INVALID_PROCESSTRACE_HANDLE uint64 = C.INVALID_PROCESSTRACE_HANDLE
+)
+
 // ExistsError is returned by NewSession if the session name is already taken.
 //
 // Having ExistsError you have an option to force kill the session:
@@ -355,7 +359,7 @@ func (s *Session) processEvents(callbackContextKey uintptr) error {
 		(C.LPWSTR)(unsafe.Pointer(&s.etwSessionName[0])),
 		(C.UINT64)(callbackContextKey),
 	)
-	if C.INVALID_PROCESSTRACE_HANDLE == C.TRACEHANDLE(traceHandle) {
+	if int64(INVALID_PROCESSTRACE_HANDLE) == int64(C.TRACEHANDLE(traceHandle)) {
 		return fmt.Errorf("OpenTraceW failed; %w", windows.GetLastError())
 	}
 	defer C.CloseTrace(traceHandle)
