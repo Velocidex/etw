@@ -28,7 +28,12 @@ import (
 )
 
 var (
-	INVALID_PROCESSTRACE_HANDLE uint64 = C.INVALID_PROCESSTRACE_HANDLE
+	// INVALID_PROCESSTRACE_HANDLE is ((TRACEHANDLE)INVALID_HANDLE_VALUE) which
+	// is 0xFFFFFFFFFFFFFFFF on 64-bit Windows. We hard-code the value here
+	// because cgo's constant folding mis-types the typedef'd unsigned
+	// constant when the C compiler is clang (e.g. zig cc), producing an
+	// untyped -1 that overflows uint64.
+	INVALID_PROCESSTRACE_HANDLE uint64 = ^uint64(0)
 )
 
 // ExistsError is returned by NewSession if the session name is already taken.
