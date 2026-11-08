@@ -263,8 +263,10 @@ func (p *propertyParser) parseSimpleType(i int) (string, error) {
 
 retryLoop:
 	for {
+		// FIX: TdhFormatProperty's first argument is a PTRACE_EVENT_INFO
+		// (from TdhGetEventInformation), not the PEVENT_RECORD.
 		r0, _, _ := tdhFormatProperty.Call(
-			uintptr(unsafe.Pointer(p.record)),
+			uintptr(unsafe.Pointer(p.info)),
 			uintptr(mapInfo),
 			p.ptrSize,
 			inType,
